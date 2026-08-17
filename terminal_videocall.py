@@ -1,22 +1,33 @@
 #!/usr/bin/env python3
 """
-Terminal ASCII video call over UDP.
+Terminal ASCII video call over UDP with voice.
 
-Each peer sends webcam frames as JPEG binary chunks.
-The remote peer reassembles the image and converts to ASCII locally
-(same clarity logic as webcam_ascii.py). Voice is not included yet.
+Video: each peer sends webcam frames as JPEG binary chunks; the remote peer
+reassembles the image and converts to ASCII locally (same clarity logic as
+webcam_ascii.py).
+
+Voice: mic audio captured with sounddevice, sent as raw PCM (int16 mono)
+UDP packets, reordered in a small jitter buffer and played back on the
+speaker. If audio is unavailable the call silently continues video-only.
 """
 
 from __future__ import annotations
 
 import argparse
 import os
+import queue
 import socket
 import struct
 import sys
 import threading
 import time
 from collections import defaultdict
+
+try:
+    import sounddevice as sd
+except (ImportError, OSError):
+    # voice is simply disabled if sounddevice (or its PortAudio lib) is missing
+    sd = None
 
 import cv2
 import numpy as np
@@ -33,10 +44,16 @@ from webcam_ascii import (
 )
 
 MAGIC = b"ASC1"
-# magic(4) + frame_id(u32) + chunk_idx(u16) + chunk_count(u16) + payload_len(u16)
-HEADER_FMT = "!4sIHHH"
+PT_VIDEO = 0
+PT_AUDIO = 1
+
+# magic(4) + ptype(u8) + seq(u32) + chunk_idx(u16) + chunk_count(u16) + payload_len(u16)
+HEADER_FMT = "!4sBIHHH"
 HEADER_SIZE = struct.calcsize(HEADER_FMT)
 MAX_PAYLOAD = 1200  # stay under typical UDP MTU after IP/UDP headers
+
+AUDIO_SAMPLERATE = 48000
+AUDIO_BLOCK_MS = 10  # one voice packet per 10 ms → 960 bytes, safe under MTU
 
 
 class FrameAssembler:
@@ -87,21 +104,25 @@ class FrameAssembler:
             return data
 
 
-def pack_chunks(frame_id: int, jpeg: bytes) -> list[bytes]:
+def pack_chunks(seq: int, jpeg: bytes, ptype: int = PT_VIDEO) -> list[bytes]:
     total = (len(jpeg) + MAX_PAYLOAD - 1) // MAX_PAYLOAD
     packets: list[bytes] = []
     for idx in range(total):
         start = idx * MAX_PAYLOAD
         piece = jpeg[start : start + MAX_PAYLOAD]
-        header = struct.pack(HEADER_FMT, MAGIC, frame_id, idx, total, len(piece))
+        header = struct.pack(HEADER_FMT, MAGIC, ptype, seq, idx, total, len(piece))
         packets.append(header + piece)
     return packets
 
 
-def parse_packet(packet: bytes) -> tuple[int, int, int, bytes] | None:
+def pack_audio(seq: int, pcm: bytes) -> bytes:
+    return struct.pack(HEADER_FMT, MAGIC, PT_AUDIO, seq, 0, 1, len(pcm)) + pcm
+
+
+def parse_packet(packet: bytes) -> tuple[int, int, int, int, bytes] | None:
     if len(packet) < HEADER_SIZE:
         return None
-    magic, frame_id, chunk_idx, chunk_count, payload_len = struct.unpack(
+    magic, ptype, seq, chunk_idx, chunk_count, payload_len = struct.unpack(
         HEADER_FMT, packet[:HEADER_SIZE]
     )
     if magic != MAGIC or chunk_count < 1 or chunk_idx >= chunk_count:
@@ -109,10 +130,15 @@ def parse_packet(packet: bytes) -> tuple[int, int, int, bytes] | None:
     payload = packet[HEADER_SIZE : HEADER_SIZE + payload_len]
     if len(payload) != payload_len:
         return None
-    return frame_id, chunk_idx, chunk_count, payload
+    return ptype, seq, chunk_idx, chunk_count, payload
 
 
-def recv_loop(sock: socket.socket, assembler: FrameAssembler, stop: threading.Event) -> None:
+def recv_loop(
+    sock: socket.socket,
+    assembler: FrameAssembler,
+    audio_rx: "AudioReceiver | None",
+    stop: threading.Event,
+) -> None:
     sock.settimeout(0.5)
     while not stop.is_set():
         try:
@@ -124,8 +150,11 @@ def recv_loop(sock: socket.socket, assembler: FrameAssembler, stop: threading.Ev
         parsed = parse_packet(data)
         if parsed is None:
             continue
-        frame_id, chunk_idx, chunk_count, payload = parsed
-        assembler.push(frame_id, chunk_idx, chunk_count, payload)
+        ptype, seq, chunk_idx, chunk_count, payload = parsed
+        if ptype == PT_VIDEO:
+            assembler.push(seq, chunk_idx, chunk_count, payload)
+        elif ptype == PT_AUDIO and audio_rx is not None:
+            audio_rx.push(seq, payload)
 
 
 def send_loop(
@@ -182,6 +211,135 @@ def send_loop(
         cap.release()
 
 
+class AudioSender:
+    """Capture mic via sounddevice and ship raw PCM (int16 mono) over UDP."""
+
+    def __init__(
+        self,
+        sock: socket.socket,
+        peer: tuple[str, int],
+        samplerate: int,
+        blocksize: int,
+        device: int | None,
+        stop: threading.Event,
+    ) -> None:
+        self.sock = sock
+        self.peer = peer
+        self.samplerate = samplerate
+        self.blocksize = blocksize
+        self.device = device
+        self.stop = stop
+        self._seq = 0
+        self._queue: queue.Queue[bytes] = queue.Queue(maxsize=256)
+
+    def _mic_callback(self, indata, _frames, _time_info, _status) -> None:
+        blob = np.ascontiguousarray(indata).tobytes()
+        try:
+            self._queue.put_nowait(blob)
+        except queue.Full:
+            try:
+                self._queue.get_nowait()  # drop oldest if we fall behind
+                self._queue.put_nowait(blob)
+            except queue.Empty:
+                pass
+
+    def run(self) -> None:
+        with sd.RawInputStream(
+            samplerate=self.samplerate,
+            blocksize=self.blocksize,
+            channels=1,
+            dtype="int16",
+            device=self.device,
+            callback=self._mic_callback,
+        ):
+            while not self.stop.is_set():
+                try:
+                    blob = self._queue.get(timeout=0.1)
+                except queue.Empty:
+                    continue
+                try:
+                    self.sock.sendto(pack_audio(self._seq, blob), self.peer)
+                except OSError:
+                    break
+                self._seq = (self._seq + 1) & 0xFFFFFFFF
+
+
+class AudioReceiver:
+    """Reorder received PCM in a small jitter buffer and play on the speaker."""
+
+    def __init__(
+        self,
+        samplerate: int,
+        blocksize: int,
+        device: int | None,
+        stop: threading.Event,
+        max_buffered: int = 200,
+    ) -> None:
+        self.samplerate = samplerate
+        self.blocksize = blocksize
+        self.device = device
+        self.stop = stop
+        self._max = max_buffered
+        self._lock = threading.Lock()
+        self._buf: dict[int, bytes] = {}
+        self._next = 0
+        self._initialized = False
+
+    def push(self, seq: int, pcm: bytes) -> None:
+        with self._lock:
+            if not self._initialized:
+                self._initialized = True
+                self._next = seq
+                self._buf[seq] = pcm
+                return
+            if seq < self._next - 1:
+                return  # already played / stale
+            self._buf[seq] = pcm
+            if len(self._buf) > self._max:
+                for old in sorted(self._buf)[: len(self._buf) - self._max]:
+                    del self._buf[old]
+
+    def _play_callback(self, outdata, frames, _time_info, _status) -> None:
+        with self._lock:
+            if self._next in self._buf:
+                data = self._buf.pop(self._next)
+                self._next += 1
+            elif self._buf:
+                smallest = min(self._buf)
+                if smallest - self._next > 20:  # big gap → resync past it
+                    self._next = smallest
+                    data = self._buf.pop(self._next)
+                    self._next += 1
+                else:
+                    data = None
+                    self._next += 1  # one slot of silence, keep moving
+            else:
+                data = None
+                self._next += 1
+        if data is None:
+            outdata.fill(0)
+            return
+        arr = np.frombuffer(data, dtype=np.int16)
+        if arr.size >= frames:
+            outdata[:, 0] = arr[:frames]
+        else:
+            outdata[:, 0] = np.concatenate(
+                (arr, np.zeros(frames - arr.size, dtype=np.int16))
+            )
+
+    def run(self) -> None:
+        with sd.RawOutputStream(
+            samplerate=self.samplerate,
+            blocksize=self.blocksize,
+            channels=1,
+            dtype="int16",
+            device=self.device,
+            callback=self._play_callback,
+        ):
+            while not self.stop.is_set():
+                time.sleep(0.1)
+
+
 def decode_jpeg(data: bytes) -> np.ndarray | None:
     arr = np.frombuffer(data, dtype=np.uint8)
     frame = cv2.imdecode(arr, cv2.IMREAD_COLOR)
@@ -203,7 +361,7 @@ def parse_peer(value: str) -> tuple[str, int]:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="UDP terminal ASCII video call (image binary over UDP, ASCII on receiver)"
+        description="UDP terminal ASCII video call (image + voice over UDP)"
     )
     parser.add_argument(
         "--listen",
@@ -234,6 +392,29 @@ def main() -> None:
     parser.add_argument("--cols", type=int, default=None, help="Max ASCII columns")
     parser.add_argument("--no-color", action="store_true", help="Grayscale ASCII")
     parser.add_argument("--invert", action="store_true", help="Invert brightness")
+    parser.add_argument(
+        "--no-audio",
+        action="store_true",
+        help="Disable voice; video only",
+    )
+    parser.add_argument(
+        "--samplerate",
+        type=int,
+        default=AUDIO_SAMPLERATE,
+        help=f"Audio sample rate Hz (default: {AUDIO_SAMPLERATE})",
+    )
+    parser.add_argument(
+        "--mic",
+        type=int,
+        default=None,
+        help="Input (mic) sounddevice device index",
+    )
+    parser.add_argument(
+        "--speaker",
+        type=int,
+        default=None,
+        help="Output (speaker) sounddevice device index",
+    )
     args = parser.parse_args()
 
     if not sys.stdout.isatty():
@@ -249,13 +430,48 @@ def main() -> None:
     stop = threading.Event()
 
     threads = [
-        threading.Thread(target=recv_loop, args=(sock, assembler, stop), daemon=True),
         threading.Thread(
             target=send_loop,
             args=(sock, args.peer, args.camera, args.width, args.quality, args.fps, stop),
             daemon=True,
         ),
     ]
+
+    audio_ok = False
+    audio_rx: AudioReceiver | None = None
+    if not args.no_audio and sd is not None:
+        blocksize = max(1, int(args.samplerate * AUDIO_BLOCK_MS / 1000))
+
+        def _audio_guard(name: str, fn) -> threading.Thread:
+            def wrapper() -> None:
+                try:
+                    fn()
+                except Exception as exc:  # noqa: BLE001 - keep the call alive
+                    if not stop.is_set():
+                        print(
+                            f"Audio {name} failed ({exc}); continuing video-only.",
+                            file=sys.stderr,
+                        )
+
+            return threading.Thread(target=wrapper, daemon=True)
+
+        tx = AudioSender(sock, args.peer, args.samplerate, blocksize, args.mic, stop)
+        rx = AudioReceiver(args.samplerate, blocksize, args.speaker, stop)
+        audio_rx = rx
+        audio_ok = True
+        threads.append(_audio_guard("mic", tx.run))
+        threads.append(_audio_guard("speaker", rx.run))
+    elif args.no_audio:
+        print("Voice: off (--no-audio)", file=sys.stderr)
+    else:
+        print("Voice: off (sounddevice not installed)", file=sys.stderr)
+
+    threads.insert(
+        0,
+        threading.Thread(
+            target=recv_loop, args=(sock, assembler, audio_rx, stop), daemon=True
+        ),
+    )
     for t in threads:
         t.start()
 
@@ -268,7 +484,8 @@ def main() -> None:
     sys.stdout.write(HIDE_CURSOR + CLEAR)
     sys.stdout.flush()
     print(
-        f"Calling {args.peer[0]}:{args.peer[1]} (listening on UDP {args.listen})…",
+        f"Calling {args.peer[0]}:{args.peer[1]} (listening on UDP {args.listen})… "
+        + ("voice:on" if audio_ok else "voice:off"),
         file=sys.stderr,
     )
 
@@ -305,6 +522,7 @@ def main() -> None:
             status = (
                 f"{RESET}call {args.peer[0]}:{args.peer[1]} | "
                 f"{cols}x{use_rows} | {display_fps:.0f} fps | "
+                f"voice:{'on' if audio_ok else 'off'} | "
                 f"ok:{assembler.frames_ok} drop:{assembler.frames_drop} | Ctrl+C quit"
             )
             sys.stdout.write(HOME + art + "\n" + status[:cols].ljust(cols))
