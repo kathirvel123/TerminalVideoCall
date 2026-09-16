@@ -161,9 +161,15 @@ class PeerSession:
                 await self._on_media(self.peer_id, payload, self._media_mime)
                 self._media_buf = {}
 
-    async def send_text(self, text: str):
-        if self._chat_channel and self._chat_channel.readyState == "open":
-            self._chat_channel.send(json.dumps({"text": text}))
+    async def send_text(self, text: str) -> bool:
+        if not self._chat_channel:
+            logger.warning(f"Chat channel not created yet for {self.peer_id}")
+            return False
+        if self._chat_channel.readyState != "open":
+            logger.warning(f"Chat channel not open for {self.peer_id} (state={self._chat_channel.readyState})")
+            return False
+        self._chat_channel.send(json.dumps({"text": text}))
+        return True
 
     async def send_media(self, data: bytes, mime: str, chunk_size: int = 16384):
         """Chunk and send binary media over the media DataChannel."""
@@ -391,11 +397,21 @@ class WebRTCEngine:
     async def send_text(self, peer_id: str, text: str):
         """Open a connection to peer_id if needed and send a text message."""
         session = await self._initiate_if_needed(peer_id)
-        await session.send_text(text)
+        ok = await session.send_text(text)
+        if not ok:
+            raise ConnectionError(
+                f"DataChannel not ready yet for {peer_id}. "
+                "Wait for the P2P connection to establish (you'll see 'P2P connection established')."
+            )
 
     async def send_media(self, peer_id: str, data: bytes, mime: str):
         """Send raw image or GIF bytes to a peer."""
         session = await self._initiate_if_needed(peer_id)
+        if not session._media_channel or session._media_channel.readyState != "open":
+            raise ConnectionError(
+                f"Media DataChannel not ready yet for {peer_id}. "
+                "Wait for the P2P connection to establish first."
+            )
         await session.send_media(data, mime)
 
     async def start_call(self, peer_id: str, camera_index: int = 0):

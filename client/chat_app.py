@@ -358,6 +358,8 @@ async def main():
                 try:
                     await engine.send_text(state.active_peer, raw)
                     print_msg(user_id, raw, user_id)
+                except ConnectionError as e:
+                    print(c(f"  ⏳ {e}", YELLOW))
                 except Exception as e:
                     print(c(f"  Send error: {e}", RED))
 
