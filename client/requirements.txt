@@ -3,7 +3,4 @@ websockets
 opencv-python
 numpy
 Pillow
-prompt_toolkit
 sounddevice
-textual
-httpx
