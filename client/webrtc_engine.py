@@ -351,6 +351,19 @@ class WebRTCEngine:
             logger.info("Signaling WebSocket closed")
             self._running = False
 
+    async def _safe_set_local_description(self, pc: RTCPeerConnection, description: RTCSessionDescription):
+        """Set a local answer defensively against aiortc's '_offerDirection is None' bug.
+
+        aiortc's setLocalDescription(answer) calls and_direction(t.direction,
+        t._offerDirection); if _offerDirection is None this raises
+        "ValueError: None is not in list". We patch any such transceiver first.
+        """
+        if description.type in ("answer", "pranswer"):
+            for t in pc.getTransceivers():
+                if getattr(t, "_offerDirection", None) is None:
+                    t._offerDirection = t.direction or "sendrecv"
+        await pc.setLocalDescription(description)
+
     async def _dispatch(self, msg: dict):
         sender = msg.get("sender_id")
         mtype = msg.get("type")
@@ -361,26 +374,27 @@ class WebRTCEngine:
             return
 
         if mtype == "call_request":
-            # Remote peer wants to call us — create a callee session
+            # Remote peer wants to call us — create a callee session.
+            # The webcam is attached later, when the actual offer arrives
+            # (only if the offer requests video).
             session = await self._get_or_create_session(sender, is_offerer=False)
-            # Add our webcam so the answer includes video media
-            if not session._webcam_track:
-                session.start_webcam(self._camera_index)
             logger.info(f"Incoming call from {sender}")
 
         elif mtype == "offer":
             session = await self._get_or_create_session(sender, is_offerer=False)
-            # Ensure our webcam is attached so the answer includes video media
-            if not session._webcam_track:
-                session.start_webcam(self._camera_index)
             await session.pc.setRemoteDescription(
                 RTCSessionDescription(sdp=payload["sdp"], type=payload["type"])
             )
             # Flush any ICE candidates that arrived before the remote description
             for candidate in session._flush_pending_ice():
                 await session.add_ice(candidate)
+            # Attach our webcam ONLY if the remote offer actually requests video.
+            # Doing this blindly crashes aiortc with "None is not in list" when the
+            # offer is chat-only (e.g. a peer still running the old client).
+            if "m=video" in payload.get("sdp", "") and not session._webcam_track:
+                session.start_webcam(self._camera_index)
             answer = await session.pc.createAnswer()
-            await session.pc.setLocalDescription(answer)
+            await self._safe_set_local_description(session.pc, answer)
             await self._send_signal(sender, "answer", {
                 "sdp": session.pc.localDescription.sdp,
                 "type": session.pc.localDescription.type,
