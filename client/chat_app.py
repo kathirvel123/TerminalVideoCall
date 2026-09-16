@@ -313,6 +313,7 @@ async def main():
         on_call_end=on_call_end,
         on_peer_connected=on_peer_connected,
         on_error=on_error,
+        camera_index=CAMERA_INDEX,
     )
 
     try:

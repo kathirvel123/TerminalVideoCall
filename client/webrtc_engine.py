@@ -228,6 +228,7 @@ class WebRTCEngine:
         on_call_end: Callable = None,
         on_peer_connected: Callable = None,
         on_error: Callable = None,
+        camera_index: int = 0,
     ):
         # Auto-convert http(s):// → ws(s):// so users can paste their Render URL directly
         if signaling_url.startswith("https://"):
@@ -240,6 +241,7 @@ class WebRTCEngine:
         self._ws: Optional[Any] = None
         self._peers: Dict[str, PeerSession] = {}
         self._running = False
+        self._camera_index = camera_index
 
         # Default no-op callbacks
         async def noop(*_): pass
@@ -283,10 +285,16 @@ class WebRTCEngine:
         if mtype == "call_request":
             # Remote peer wants to call us — create a callee session
             session = await self._get_or_create_session(sender, is_offerer=False)
+            # Add our webcam so the answer includes video media
+            if not session._webcam_track:
+                session.start_webcam(self._camera_index)
             logger.info(f"Incoming call from {sender}")
 
         elif mtype == "offer":
             session = await self._get_or_create_session(sender, is_offerer=False)
+            # Ensure our webcam is attached so the answer includes video media
+            if not session._webcam_track:
+                session.start_webcam(self._camera_index)
             await session.pc.setRemoteDescription(
                 RTCSessionDescription(sdp=payload["sdp"], type=payload["type"])
             )
@@ -417,8 +425,7 @@ class WebRTCEngine:
     async def start_call(self, peer_id: str, camera_index: int = 0):
         """Initiate a video call with a peer."""
         await self._send_signal(peer_id, "call_request", {})
-        session = await self._initiate_if_needed(peer_id)
-        session.start_webcam(camera_index)
+        session = await self._initiate_if_needed(peer_id, with_webcam=True, camera_index=camera_index)
 
     async def end_call(self, peer_id: str):
         session = self._peers.get(peer_id)
@@ -427,18 +434,30 @@ class WebRTCEngine:
             session._webcam_track = None
         await self._on_call_end(peer_id)
 
-    async def _initiate_if_needed(self, peer_id: str) -> PeerSession:
+    async def _initiate_if_needed(self, peer_id: str, with_webcam: bool = False, camera_index: int = 0) -> PeerSession:
         """Create a session and send an offer if no session exists yet."""
         if peer_id not in self._peers:
             session = await self._get_or_create_session(peer_id, is_offerer=True)
+            if with_webcam:
+                session.start_webcam(camera_index)
             offer = await session.pc.createOffer()
             await session.pc.setLocalDescription(offer)
             await self._send_signal(peer_id, "offer", {
                 "sdp": session.pc.localDescription.sdp,
                 "type": session.pc.localDescription.type,
             })
-            return session
-        return self._peers[peer_id]
+        else:
+            session = self._peers[peer_id]
+            if with_webcam and not session._webcam_track:
+                # Existing chat session — add webcam and renegotiate
+                session.start_webcam(camera_index)
+                offer = await session.pc.createOffer()
+                await session.pc.setLocalDescription(offer)
+                await self._send_signal(peer_id, "offer", {
+                    "sdp": session.pc.localDescription.sdp,
+                    "type": session.pc.localDescription.type,
+                })
+        return session
 
     async def close(self):
         self._running = False
