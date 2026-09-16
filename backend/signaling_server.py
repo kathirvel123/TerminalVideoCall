@@ -18,6 +18,18 @@ async def root():
     return {"message": "Signaling server is running"}
 
 
+@app.get("/presence/{user_id}")
+async def check_presence(user_id: str):
+    """Check if a specific user is currently online."""
+    return {"user_id": user_id, "online": user_id in active_connections}
+
+
+@app.get("/online")
+async def list_online():
+    """Return a list of all currently connected user IDs."""
+    return {"online_users": list(active_connections.keys())}
+
+
 @app.websocket("/ws/{user_id}")
 async def websocket_endpoint(websocket: WebSocket, user_id: str):
     await websocket.accept()

@@ -223,6 +223,12 @@ class WebRTCEngine:
         on_peer_connected: Callable = None,
         on_error: Callable = None,
     ):
+        # Auto-convert http(s):// → ws(s):// so users can paste their Render URL directly
+        if signaling_url.startswith("https://"):
+            signaling_url = "wss://" + signaling_url[len("https://"):]
+        elif signaling_url.startswith("http://"):
+            signaling_url = "ws://" + signaling_url[len("http://"):]
+
         self._url = signaling_url
         self._user_id = user_id
         self._ws: Optional[Any] = None
