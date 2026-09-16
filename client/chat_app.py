@@ -357,11 +357,12 @@ class MessageBubble(Static):
         super().__init__(text, classes="message-block")
 
 
-class ConversationItem(Static):
+class ConversationItem(Widget):
     """A sidebar item representing one conversation."""
 
     def __init__(self, peer_id: str, last_msg: str = "", online: bool = False):
-        super().__init__()
+        # Use a unique id so Textual can track each item in the list
+        super().__init__(id=f"conv-item-{peer_id}")
         self.peer_id = peer_id
         self.last_msg = last_msg
         self.is_online = online
@@ -371,11 +372,14 @@ class ConversationItem(Static):
         badge_class = "online-badge" if self.is_online else "offline-badge"
         label_class = "conv-peer-label online" if self.is_online else "conv-peer-label"
 
-        with Horizontal(classes="conv-row"):
-            yield Label(badge, classes=badge_class)
-            yield Label(self.peer_id[:14], classes=label_class)
-            yield Button("📞", classes="conv-call-btn", id=f"call-{self.peer_id}")
-
+        # Pass children via constructor — avoids NoActiveAppError that occurs
+        # when using 'with Horizontal()' context manager on unmounted widgets.
+        yield Horizontal(
+            Label(badge, classes=badge_class),
+            Label(self.peer_id[:14], classes=label_class),
+            Button("📞", classes="conv-call-btn", id=f"call-{self.peer_id}"),
+            classes="conv-row",
+        )
         preview = self.last_msg[:24] + "…" if len(self.last_msg) > 24 else self.last_msg
         yield Label(preview or "No messages yet", classes="conv-last-msg")
 
@@ -529,20 +533,22 @@ class TerminalChatApp(App):
 
     def _rebuild_sidebar(self):
         """Re-render the entire sidebar conversation list."""
-        try:
-            container = self.query_one("#conversation-list", ScrollableContainer)
-            container.remove_children()
-            for peer_id, info in self.conversations.items():
-                item = ConversationItem(
-                    peer_id=peer_id,
-                    last_msg=info.get("last_msg", ""),
-                    online=info.get("online", False),
-                )
-                if peer_id == self.active_peer:
-                    item.add_class("active")
-                container.mount(item)
-        except NoMatches:
-            pass
+        async def _do_rebuild():
+            try:
+                container = self.query_one("#conversation-list", ScrollableContainer)
+                await container.remove_children()
+                for peer_id, info in self.conversations.items():
+                    item = ConversationItem(
+                        peer_id=peer_id,
+                        last_msg=info.get("last_msg", ""),
+                        online=info.get("online", False),
+                    )
+                    if peer_id == self.active_peer:
+                        item.add_class("active")
+                    await container.mount(item)
+            except NoMatches:
+                pass
+        self.call_after_refresh(_do_rebuild)
 
     @work(exclusive=False, thread=True)
     def _poll_presence(self):
