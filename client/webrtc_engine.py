@@ -35,6 +35,7 @@ import asyncio
 import json
 import logging
 import os
+import traceback
 from typing import Callable, Awaitable, Dict, Optional, Any
 
 import cv2
@@ -51,8 +52,16 @@ from av import VideoFrame
 
 logger = logging.getLogger(__name__)
 
-# Public Google STUN servers — no setup required
+# Public Google STUN servers — no setup required.
+# For calls across restrictive NATs, set TURN_URL/TURN_USERNAME/TURN_PASSWORD env vars.
 ICE_SERVERS = [{"urls": ["stun:stun.l.google.com:19302", "stun:stun1.l.google.com:19302"]}]
+_turn = os.getenv("TURN_URL")
+if _turn:
+    _turn_cfg = {"urls": [_turn]}
+    if os.getenv("TURN_USERNAME"):
+        _turn_cfg["username"] = os.getenv("TURN_USERNAME")
+        _turn_cfg["credential"] = os.getenv("TURN_PASSWORD", "")
+    ICE_SERVERS.append(_turn_cfg)
 
 
 # ---------------------------------------------------------------------------
@@ -123,14 +132,72 @@ class PeerSession:
         self._media_buf: Dict[int, bytes] = {}  # chunk_idx -> bytes
         self._media_total: int = 0
         self._media_mime: str = ""
+        self._pending_ice: list[RTCIceCandidate] = []
+        self._ice_waiters: list[asyncio.Future] = []
+        self.connected = False
+        self._pending_chat: list[str] = []
+        self._pending_media: list[tuple[bytes, str]] = []
+        self._ready_event: Optional[asyncio.Event] = None
+
+    def _flush_pending_ice(self):
+        pending, self._pending_ice = self._pending_ice, []
+        for fut in self._ice_waiters:
+            if not fut.done():
+                fut.set_result(None)
+        self._ice_waiters = []
+        return pending
+
+    async def add_ice(self, candidate: RTCIceCandidate):
+        """Add an ICE candidate, queueing it if the remote description isn't set yet."""
+        if self.pc.remoteDescription is None:
+            self._pending_ice.append(candidate)
+        else:
+            try:
+                await self.pc.addIceCandidate(candidate)
+            except Exception as e:
+                logger.warning(f"addIceCandidate for {self.peer_id} failed: {e}")
+
+    def _flush_pending_chat(self):
+        if not self._chat_channel or self._chat_channel.readyState != "open":
+            return
+        while self._pending_chat:
+            text = self._pending_chat.pop(0)
+            try:
+                self._chat_channel.send(json.dumps({"text": text}))
+            except Exception as e:
+                logger.warning(f"Failed to flush chat for {self.peer_id}: {e}")
+                self._pending_chat.insert(0, text)
+                break
+
+    def _flush_pending_media(self):
+        if not self._media_channel or self._media_channel.readyState != "open":
+            return
+        while self._pending_media:
+            data, mime = self._pending_media.pop(0)
+            try:
+                self._media_channel.send(json.dumps({"mime": mime, "total_chunks": 1}))
+                self._media_channel.send(data)
+            except Exception as e:
+                logger.warning(f"Failed to flush media for {self.peer_id}: {e}")
+                self._pending_media.insert(0, (data, mime))
+                break
 
     def attach_chat_channel(self, channel):
         self._chat_channel = channel
         channel.on("message")(self._handle_chat_message)
+        channel.on("open")(self._on_channel_open)
 
     def attach_media_channel(self, channel):
         self._media_channel = channel
         channel.on("message")(self._handle_media_message)
+        channel.on("open")(self._on_channel_open)
+
+    async def _on_channel_open(self):
+        self.connected = True
+        if self._ready_event and not self._ready_event.is_set():
+            self._ready_event.set()
+        self._flush_pending_chat()
+        self._flush_pending_media()
 
     async def _handle_chat_message(self, message: str):
         try:
@@ -165,21 +232,31 @@ class PeerSession:
         if not self._chat_channel:
             logger.warning(f"Chat channel not created yet for {self.peer_id}")
             return False
-        if self._chat_channel.readyState != "open":
-            logger.warning(f"Chat channel not open for {self.peer_id} (state={self._chat_channel.readyState})")
-            return False
-        self._chat_channel.send(json.dumps({"text": text}))
-        return True
+        state = self._chat_channel.readyState
+        if state == "open":
+            self._chat_channel.send(json.dumps({"text": text}))
+            return True
+        if state == "connecting":
+            # Buffer the message — it will be flushed when the channel opens
+            self._pending_chat.append(text)
+            return True
+        logger.warning(f"Chat channel closed for {self.peer_id}")
+        return False
 
     async def send_media(self, data: bytes, mime: str, chunk_size: int = 16384):
         """Chunk and send binary media over the media DataChannel."""
-        if not self._media_channel or self._media_channel.readyState != "open":
-            return
-        chunks = [data[i : i + chunk_size] for i in range(0, len(data), chunk_size)]
-        header = json.dumps({"mime": mime, "total_chunks": len(chunks)})
-        self._media_channel.send(header)
-        for chunk in chunks:
-            self._media_channel.send(chunk)
+        state = (
+            self._media_channel.readyState if self._media_channel else "closed"
+        )
+        if state == "open":
+            chunks = [data[i : i + chunk_size] for i in range(0, len(data), chunk_size)]
+            self._media_channel.send(json.dumps({"mime": mime, "total_chunks": len(chunks)}))
+            for chunk in chunks:
+                self._media_channel.send(chunk)
+        elif state == "connecting":
+            self._pending_media.append((data, mime))
+        else:
+            logger.warning(f"Media channel not open for {self.peer_id}")
 
     def start_webcam(self, camera_index: int = 0):
         self._webcam_track = WebcamVideoTrack(camera_index)
@@ -269,6 +346,7 @@ class WebRTCEngine:
                     await self._dispatch(msg)
                 except Exception as e:
                     logger.error(f"Error dispatching message: {e}")
+                    traceback.print_exc()
         except websockets.ConnectionClosed:
             logger.info("Signaling WebSocket closed")
             self._running = False
@@ -298,6 +376,9 @@ class WebRTCEngine:
             await session.pc.setRemoteDescription(
                 RTCSessionDescription(sdp=payload["sdp"], type=payload["type"])
             )
+            # Flush any ICE candidates that arrived before the remote description
+            for candidate in session._flush_pending_ice():
+                await session.add_ice(candidate)
             answer = await session.pc.createAnswer()
             await session.pc.setLocalDescription(answer)
             await self._send_signal(sender, "answer", {
@@ -311,6 +392,9 @@ class WebRTCEngine:
                 await session.pc.setRemoteDescription(
                     RTCSessionDescription(sdp=payload["sdp"], type=payload["type"])
                 )
+                # Flush any ICE candidates that arrived before the remote description
+                for candidate in session._flush_pending_ice():
+                    await session.add_ice(candidate)
 
         elif mtype == "ice":
             session = self._peers.get(sender)
@@ -326,7 +410,7 @@ class WebRTCEngine:
                     sdpMid=payload.get("sdpMid"),
                     sdpMLineIndex=payload.get("sdpMLineIndex"),
                 )
-                await session.pc.addIceCandidate(candidate)
+                await session.add_ice(candidate)
 
     async def _get_or_create_session(self, peer_id: str, is_offerer: bool) -> PeerSession:
         if peer_id in self._peers:
@@ -357,6 +441,21 @@ class WebRTCEngine:
                     "sdpMid": candidate.sdpMid,
                     "sdpMLineIndex": candidate.sdpMLineIndex,
                 })
+
+        # Log connection state changes
+        @pc.on("connectionstatechange")
+        def on_conn_state():
+            logger.info(f"Connection state [{peer_id}]: {pc.connectionState}")
+            if pc.connectionState == "failed":
+                loop = asyncio.get_event_loop()
+                loop.call_soon_threadsafe(
+                    asyncio.ensure_future,
+                    self._on_error(peer_id, "P2P connection failed. Both users may be behind restrictive NATs — set TURN_URL env var if needed."),
+                )
+
+        @pc.on("iceconnectionstatechange")
+        def on_ice_state():
+            logger.info(f"ICE state [{peer_id}]: {pc.iceConnectionState}")
 
         # Incoming track (remote video)
         @pc.on("track")
@@ -408,18 +507,13 @@ class WebRTCEngine:
         ok = await session.send_text(text)
         if not ok:
             raise ConnectionError(
-                f"DataChannel not ready yet for {peer_id}. "
-                "Wait for the P2P connection to establish (you'll see 'P2P connection established')."
+                f"DataChannel not ready for {peer_id}. "
+                "Try again once both peers are online and connected."
             )
 
     async def send_media(self, peer_id: str, data: bytes, mime: str):
         """Send raw image or GIF bytes to a peer."""
         session = await self._initiate_if_needed(peer_id)
-        if not session._media_channel or session._media_channel.readyState != "open":
-            raise ConnectionError(
-                f"Media DataChannel not ready yet for {peer_id}. "
-                "Wait for the P2P connection to establish first."
-            )
         await session.send_media(data, mime)
 
     async def start_call(self, peer_id: str, camera_index: int = 0):
